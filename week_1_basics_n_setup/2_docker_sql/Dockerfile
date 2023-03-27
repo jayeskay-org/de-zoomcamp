@@ -1,3 +1,9 @@
-FROM ubuntu:latest
+FROM python:3.9
 
-ENTRYPOINT [ "bash" ]
+RUN pip install pandas
+
+WORKDIR /app
+
+COPY "pipeline.py" "pipeline.py"
+
+ENTRYPOINT [ "python", "pipeline.py" ]
