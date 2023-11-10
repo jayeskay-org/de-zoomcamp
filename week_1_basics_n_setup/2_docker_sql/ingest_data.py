@@ -1,17 +1,19 @@
 from time import time
 from sqlalchemy.engine import URL, create_engine
+from argparse import ArgumentParser
+import os
 import pandas as pd
 import pyarrow.parquet as pq
 
 
 # Create PostgreSQL class with connection credentials
 class PostgreSQL:
-    def __init__(self, database):
+    def __init__(self, user, password, host, port, database):
         self.drivername = 'postgresql+psycopg2'
-        self.user = 'root'
-        self.password = 'root'
-        self.host = 'localhost'
-        self.port = 5431
+        self.user = user
+        self.password = password
+        self.host = host
+        self.port = port
         self.database = database
 
 
@@ -29,21 +31,36 @@ class PostgreSQL:
         )
 
 
-# Define sqlalchemy engine object
-def get_engine(database):
-    credentials = PostgreSQL(database).get_credentials()
-    url = URL.create(**credentials)
-    engine = create_engine(url)
+    # Define sqlalchemy engine object
+    def get_engine(self):
+        credentials = self.get_credentials()
+        url = URL.create(**credentials)
+        engine = create_engine(url)
 
-    return engine
+        return engine
 
 
-if __name__ == '__main__':
+def main(params):
+    user = params.user
+    password = params.password
+    host = params.host
+    port = params.port
+    database = params.database
+    table = params.table
+    url = params.url
+
+    # Call PostgreSQL class object
+    postgres = PostgreSQL(user, password, host, port, database)
+
     # Construct sqlalchemy engine object
-    engine = get_engine('ny_taxi')
+    engine = postgres.get_engine()
+
+    # Download parquet file
+    os.system(f"pwd")
+    os.system(f"wget {url} -O source.parquet")
 
     # Pull in parquet file -> pd.DataFrame(); reduce to first 100 rows
-    tb = pq.read_table('/Users/jonathon/GitHub/de-zoomcamp/week_1_basics_n_setup/2_docker_sql/yellow_tripdata_2021-01.parquet').to_pandas()[:100]
+    tb = pq.read_table('source.parquet').to_pandas()[:100]
 
     # Clean up columns, cast date/time strings
     tb.columns = tb.columns.str.lower().str.replace(' ', '_')
@@ -51,7 +68,7 @@ if __name__ == '__main__':
     tb['tpep_dropoff_datetime'] = pd.to_datetime(tb['tpep_dropoff_datetime'])
 
     # Get schema based upon 
-    s = pd.io.sql.get_schema(tb, name='yellow_taxi_data', con=engine.connect())
+    s = pd.io.sql.get_schema(tb, name=table, con=engine.connect())
     print(s)
 
     # Create connection object to drop table, recreate using defined schema
@@ -60,7 +77,7 @@ if __name__ == '__main__':
         conn.execute(s)
 
     # Batch load parquet file to database
-    parquet_file = pq.ParquetFile('/Users/jonathon/GitHub/de-zoomcamp/week_1_basics_n_setup/2_docker_sql/yellow_tripdata_2021-01.parquet')
+    parquet_file = pq.ParquetFile('source.parquet')
     batch_size = 100000
     counter = 0
 
@@ -89,3 +106,22 @@ if __name__ == '__main__':
     t_end = time()
 
     print(f"{counter} rows inserted in {round(t_end - t_start, 4)} seconds")
+
+
+if __name__ == '__main__':
+    parser = ArgumentParser(
+        prog='INGEST_DATA',
+        description='Ingest .parquet file to PostgreSQL'
+    )
+
+    parser.add_argument('--user')       # root
+    parser.add_argument('--password')   # root
+    parser.add_argument('--host')       # localhost
+    parser.add_argument('--port')       # 5431
+    parser.add_argument('--database')   # ny_taxi
+    parser.add_argument('--table')      # yellow_taxi_data
+    parser.add_argument('--url')        # https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-01.parquet
+
+    args = parser.parse_args()
+
+    main(params=args)
