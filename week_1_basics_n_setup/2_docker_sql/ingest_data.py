@@ -1,5 +1,6 @@
 from time import time
 from sqlalchemy.engine import URL, create_engine
+from sqlalchemy import text
 from argparse import ArgumentParser
 import os
 import pandas as pd
@@ -67,14 +68,12 @@ def main(params):
     tb['tpep_pickup_datetime'] = pd.to_datetime(tb['tpep_pickup_datetime'])
     tb['tpep_dropoff_datetime'] = pd.to_datetime(tb['tpep_dropoff_datetime'])
 
-    # Get schema based upon 
-    s = pd.io.sql.get_schema(tb, name=table, con=engine.connect())
-    print(s)
-
-    # Create connection object to drop table, recreate using defined schema
+    # Create connection object to create schema, drop table, recreate using defined schema
     with engine.connect() as conn:
-        conn.execute(f"DROP TABLE IF EXISTS {table};")
-        conn.execute(s)
+        s = pd.io.sql.get_schema(tb, name=table, con=conn)
+
+        conn.execute(text(f"DROP TABLE IF EXISTS {table};"))
+        conn.execute(text(s))
 
     # Batch load parquet file to database
     parquet_file = pq.ParquetFile('source.parquet')
