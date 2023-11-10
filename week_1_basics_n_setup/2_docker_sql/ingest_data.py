@@ -73,7 +73,7 @@ def main(params):
 
     # Create connection object to drop table, recreate using defined schema
     with engine.connect() as conn:
-        conn.execute('DROP TABLE IF EXISTS yellow_taxi_data;')
+        conn.execute(f"DROP TABLE IF EXISTS {table};")
         conn.execute(s)
 
     # Batch load parquet file to database
@@ -97,7 +97,7 @@ def main(params):
             df_i['tpep_dropoff_datetime'] = pd.to_datetime(df_i['tpep_dropoff_datetime'])
         finally:
             counter += len(df_i)
-            df_i.to_sql(name='yellow_taxi_data', con=engine.connect(), if_exists='append', index=False)
+            df_i.to_sql(name=table, con=engine.connect(), if_exists='append', index=False)
 
         t_i_end = time()
 
