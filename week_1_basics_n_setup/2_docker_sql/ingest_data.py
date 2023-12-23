@@ -42,37 +42,38 @@ class PostgreSQL:
 
 
 @task(log_prints=True, retries=3)
-def ingest_data(params: tuple):
-    user, password, host, port, database, table, url = params
-
-    # Call PostgreSQL class object
-    postgres = PostgreSQL(user, password, host, port, database)
-
-    # Construct sqlalchemy engine object
-    engine = postgres.get_engine()
-
+def download_data(url) -> pd.DataFrame:
     # Download parquet file
     os.system(f"pwd")
     os.system(f"wget {url} -O source.parquet")
 
-    # Pull in parquet file -> pd.DataFrame(); reduce to first 100 rows
-    tb = pq.read_table('source.parquet').to_pandas()[:100]
+    pf = pq.ParquetFile('source.parquet')
+
+    return pf
+
+
+@task(log_prints=True, retries=3)
+def create_table(engine, pf, table) -> None:
+    # Pull in subset of source data
+    df = pf.read().to_pandas()[:100]
 
     # Clean up columns, cast date/time strings
-    tb.columns = tb.columns.str.lower().str.replace(' ', '_')
-    tb['tpep_pickup_datetime'] = pd.to_datetime(tb['tpep_pickup_datetime'])
-    tb['tpep_dropoff_datetime'] = pd.to_datetime(tb['tpep_dropoff_datetime'])
+    df.columns = df.columns.str.lower().str.replace(' ', '_')
+    df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'])
+    df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'])
 
     # Create connection object to create schema, drop table, recreate using defined schema
     with engine.connect() as conn:
-        s = pd.io.sql.get_schema(tb, name=table, con=conn)
+        # Create schema string
+        s = pd.io.sql.get_schema(df, name=table, con=conn)
 
+        # Drop table (if exists); create using schema string (as SQLAlchemy text)
         conn.execute(text(f"DROP TABLE IF EXISTS {table};"))
         conn.execute(text(s))
 
-    # Batch load parquet file to database
-    parquet_file = pq.ParquetFile('source.parquet')
-    batch_size = 100000
+
+@task(log_prints=True, retries=3)
+def ingest_data(parquet_file, batch_size, table, engine):
     counter = 0
 
     t_start = time()
@@ -83,7 +84,7 @@ def ingest_data(params: tuple):
         try:
             df_i = batch.to_pandas()
         except Exception as err:
-            print(f"Unexpected {err=}, {type(err)=}")
+            print(f"Unexpected {err}, {type(err)=}")
             raise
         else:
             df_i.columns = df_i.columns.str.replace(' ', '_').str.lower()
@@ -112,9 +113,10 @@ def main_flow():
     table = 'yellow_taxi_data'
     url = 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-01.parquet'
 
-    params = (user, password, host, port, database, table, url)
-
-    ingest_data(params=params)
+    parquet_file = download_data(url)
+    engine = PostgreSQL(user, password, host, port, database).get_engine()
+    create_table(engine, parquet_file, table)
+    ingest_data(parquet_file=parquet_file, batch_size=100000, table=table, engine=engine)
 
 
 if __name__ == '__main__':
