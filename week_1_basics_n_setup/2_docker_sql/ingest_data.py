@@ -1,7 +1,7 @@
 from time import time
 from sqlalchemy.engine import URL, create_engine
 from sqlalchemy import text
-from argparse import ArgumentParser
+from prefect import flow, task
 import os
 import pandas as pd
 import pyarrow.parquet as pq
@@ -41,14 +41,9 @@ class PostgreSQL:
         return engine
 
 
-def main(params):
-    user = params.user
-    password = params.password
-    host = params.host
-    port = params.port
-    database = params.database
-    table = params.table
-    url = params.url
+@task(log_prints=True, retries=3)
+def ingest_data(params: tuple):
+    user, password, host, port, database, table, url = params
 
     # Call PostgreSQL class object
     postgres = PostgreSQL(user, password, host, port, database)
@@ -107,20 +102,20 @@ def main(params):
     print(f"{counter} rows inserted in {round(t_end - t_start, 4)} seconds")
 
 
+@flow(name='Flow: Ingest')
+def main_flow():
+    user = 'root'
+    password = 'root'
+    host = 'localhost'
+    port = '5431'
+    database = 'ny_taxi'
+    table = 'yellow_taxi_data'
+    url = 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-01.parquet'
+
+    params = (user, password, host, port, database, table, url)
+
+    ingest_data(params=params)
+
+
 if __name__ == '__main__':
-    parser = ArgumentParser(
-        prog='INGEST_DATA',
-        description='Ingest .parquet file to PostgreSQL'
-    )
-
-    parser.add_argument('--user')       # root
-    parser.add_argument('--password')   # root
-    parser.add_argument('--host')       # localhost
-    parser.add_argument('--port')       # 5431
-    parser.add_argument('--database')   # ny_taxi
-    parser.add_argument('--table')      # yellow_taxi_data
-    parser.add_argument('--url')        # https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-01.parquet
-
-    args = parser.parse_args()
-
-    main(params=args)
+    main_flow()
