@@ -103,6 +103,11 @@ def ingest_data(parquet_file, batch_size, table, engine):
     print(f"{counter} rows inserted in {round(t_end - t_start, 4)} seconds")
 
 
+@flow(name='Subflow: Table Name')
+def log_subflow(table_name: str) -> None:
+    print(f"Logging subflow for {table_name}")
+
+
 @flow(name='Flow: Ingest')
 def main_flow():
     user = 'root'
@@ -112,6 +117,8 @@ def main_flow():
     database = 'ny_taxi'
     table = 'yellow_taxi_data'
     url = 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-01.parquet'
+
+    log_subflow(table_name=table)
 
     parquet_file = download_data(url)
     engine = PostgreSQL(user, password, host, port, database).get_engine()
