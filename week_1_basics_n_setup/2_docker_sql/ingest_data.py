@@ -2,6 +2,7 @@ from time import time
 from sqlalchemy.engine import URL, create_engine
 from sqlalchemy import text
 from prefect import flow, task
+from prefect_sqlalchemy import SqlAlchemyConnector
 import os
 import pandas as pd
 import pyarrow.parquet as pq
@@ -42,12 +43,15 @@ class PostgreSQL:
 
 
 @task(log_prints=True, retries=3)
-def download_data(url) -> pd.DataFrame:
-    # Download parquet file
-    os.system(f"pwd")
-    os.system(f"wget {url} -O source.parquet")
+def download_data(url: str) -> pd.DataFrame:
+    # Extract filename from URL
+    filename = url.split('/')[-1]
 
-    pf = pq.ParquetFile('source.parquet')
+    # Download parquet file
+    os.system('pwd')
+    os.system(f"wget {url} -O {filename}")
+
+    pf = pq.ParquetFile(filename)
 
     return pf
 
@@ -110,20 +114,18 @@ def log_subflow(table_name: str) -> None:
 
 @flow(name='Flow: Ingest')
 def main_flow():
-    user = 'root'
-    password = 'root'
-    host = 'localhost'
-    port = '5431'
-    database = 'ny_taxi'
     table = 'yellow_taxi_data'
     url = 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-01.parquet'
 
     log_subflow(table_name=table)
 
     parquet_file = download_data(url)
-    engine = PostgreSQL(user, password, host, port, database).get_engine()
-    create_table(engine, parquet_file, table)
-    ingest_data(parquet_file=parquet_file, batch_size=100000, table=table, engine=engine)
+
+    postgresql_connector = SqlAlchemyConnector.load('postgresql-connector')
+    postgresql_engine = postgresql_connector.get_engine()
+
+    create_table(postgresql_engine, parquet_file, table)
+    ingest_data(parquet_file=parquet_file, batch_size=100000, table=table, engine=postgresql_engine)
 
 
 if __name__ == '__main__':
