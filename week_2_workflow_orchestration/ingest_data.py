@@ -1,5 +1,4 @@
 from time import time
-from sqlalchemy.engine import URL, create_engine
 from sqlalchemy import text
 from prefect import flow, task
 from prefect_sqlalchemy import SqlAlchemyConnector
@@ -7,40 +6,77 @@ from prefect_aws import AwsCredentials, S3Bucket
 import os
 import pandas as pd
 import pyarrow.parquet as pq
+import pandas_redshift as pr
 
 
-# Create PostgreSQL class with connection credentials
-class PostgreSQL:
-    def __init__(self, user, password, host, port, database):
-        self.drivername = 'postgresql+psycopg2'
-        self.user = user
-        self.password = password
-        self.host = host
-        self.port = port
-        self.database = database
+# Create AWSLoader class with connection credentials for Redshift
+class AWSLoader:
+    def __init__(self, connector_block: SqlAlchemyConnector, credentials_block: AwsCredentials):
+        sqlalchemy_params = [attr[1] for attr in connector_block.connection_info]
+
+        self.driver = sqlalchemy_params[0]
+        self.database = sqlalchemy_params[1]
+        self.user = sqlalchemy_params[2]
+        self.password = sqlalchemy_params[3]
+        self.host = sqlalchemy_params[4]
+        self.port = sqlalchemy_params[5]
+
+        aws_params = [credentials_block.aws_access_key_id, credentials_block.aws_secret_access_key]
+
+        self.aws_access_key_id = aws_params[0]
+        self.aws_secret_access_key = aws_params[1]
 
 
-    def get_credentials(self):
+    def get_sqlalchemy_credentials(self):
         return \
         (
             {
-                'drivername': self.drivername,
-                'username': self.user,
-                'password': self.password,
+                'dbname': self.database,
                 'host': self.host,
                 'port': self.port,
-                'database': self.database
+                'user': self.user,
+                'password': self.password.get_secret_value(),
             }
         )
 
 
-    # Define sqlalchemy engine object
-    def get_engine(self):
-        credentials = self.get_credentials()
-        url = URL.create(**credentials)
-        engine = create_engine(url)
+    def get_aws_credentials(self):
+        return \
+        (
+            {
+                'aws_access_key_id': self.aws_access_key_id,
+                'aws_secret_access_key': self.aws_secret_access_key.get_secret_value()
+            }
+        )
 
-        return engine
+
+    # Define SQLAlchemy engine object
+    def connect_to_redshift(self) -> None:
+        sqlalchemy_credentials = self.get_sqlalchemy_credentials()
+        aws_credentials = self.get_aws_credentials()
+        
+        # Connect to Redshift
+        pr.connect_to_redshift(**sqlalchemy_credentials)
+
+        # Connect to S3
+        pr.connect_to_s3(
+            **aws_credentials,
+            bucket='dez2023-dez-prefect',
+            subdirectory='test'
+        )
+
+
+    # Load DataFrame
+    def load_to_redshift(self, data_frame: pd.DataFrame, table_name: str) -> None:
+        pr.pandas_to_redshift(
+            data_frame=data_frame,
+            redshift_table_name=table_name,
+            append=True
+        )
+
+
+    def close_connection(self):
+        pr.close_up_shop()
 
 
 @task(log_prints=True, retries=3)
@@ -49,10 +85,13 @@ def download_data(url: str, push_to_s3: bool) -> pd.DataFrame:
     filename = url.split('/')[-1]
 
     # Download parquet file
+    print(f"DOWNLOADING: {filename} from {url}")
     os.system('pwd')
     os.system(f"wget {url} -O {filename}")
 
     pf = pq.ParquetFile(filename)
+
+    print(f"DOWNLOADED: {filename}")
 
     if push_to_s3:
         # Load AWS credentials from block
@@ -68,7 +107,7 @@ def download_data(url: str, push_to_s3: bool) -> pd.DataFrame:
         # Specify parquet file
         s3_bucket_path = s3_bucket.upload_from_path(from_path=filename, to_path=filename)
 
-        print(s3_bucket_path)
+        print(f"UPLOADED: {s3_bucket_path}/{filename}")
 
     return pf
 
@@ -94,8 +133,13 @@ def create_table(engine, pf, table) -> None:
 
 
 @task(log_prints=True, retries=3)
-def ingest_data(parquet_file, batch_size, table, engine):
+def ingest_data(parquet_file, batch_size, table, connector_block: SqlAlchemyConnector, credentials_block: AwsCredentials, url: str, export_to_s3: bool):
     counter = 0
+
+    df = pd.DataFrame()
+
+    aws_loader = AWSLoader(connector_block=connector_block, credentials_block=credentials_block)
+    aws_loader.connect_to_redshift()
 
     t_start = time()
 
@@ -113,15 +157,37 @@ def ingest_data(parquet_file, batch_size, table, engine):
             df_i['tpep_dropoff_datetime'] = pd.to_datetime(df_i['tpep_dropoff_datetime'])
         finally:
             counter += len(df_i)
-            df_i.to_sql(name=table, con=engine.connect(), if_exists='append', index=False)
+            aws_loader.load_to_redshift(data_frame=df_i, table_name=table)
+            df = pd.concat([df, df_i])
 
         t_i_end = time()
 
         print(f"{batch_size} rows inserted in {round(t_i_end - t_i_start, 4)} seconds")
 
+    aws_loader.close_connection()
+
     t_end = time()
 
     print(f"{counter} rows inserted in {round(t_end - t_start, 4)} seconds")
+
+    if export_to_s3:
+        bucket_name = 'dez2023-dez-prefect'
+        filename = url.split('/')[-1].replace('.parquet', '_CLEANSED.parquet')
+
+        df.to_parquet(filename)
+        
+        print(F"UPLOADING: {bucket_name}/{filename}")
+
+        # Load AWS credentials from block
+        aws_credentials_block = AwsCredentials.load('dez-credentials')
+
+        s3_bucket = S3Bucket(
+            bucket_name=bucket_name,
+            credentials=aws_credentials_block,
+        )
+
+        # Specify parquet file
+        s3_bucket.upload_from_path(from_path=filename, to_path=filename)
 
 
 @flow(name='Subflow: Table Name')
@@ -138,11 +204,20 @@ def main_flow():
 
     parquet_file = download_data(url, push_to_s3=True)
 
-    postgresql_connector = SqlAlchemyConnector.load('postgresql-connector')
-    postgresql_engine = postgresql_connector.get_engine()
+    redshift_connector = SqlAlchemyConnector.load('redshift-connector')
+    redshift_engine = redshift_connector.get_engine()
 
-    create_table(postgresql_engine, parquet_file, table)
-    ingest_data(parquet_file=parquet_file, batch_size=100000, table=table, engine=postgresql_engine)
+    create_table(redshift_engine, parquet_file, table=table)
+
+    ingest_data(
+        parquet_file=parquet_file,
+        batch_size=100000,
+        table=table,
+        connector_block=SqlAlchemyConnector.load('redshift-connector'),
+        credentials_block=AwsCredentials.load('dez-credentials'),
+        url=url,
+        export_to_s3=True
+    )
 
 
 if __name__ == '__main__':
