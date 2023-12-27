@@ -3,6 +3,7 @@ from sqlalchemy.engine import URL, create_engine
 from sqlalchemy import text
 from prefect import flow, task
 from prefect_sqlalchemy import SqlAlchemyConnector
+from prefect_aws import AwsCredentials, S3Bucket
 import os
 import pandas as pd
 import pyarrow.parquet as pq
@@ -43,7 +44,7 @@ class PostgreSQL:
 
 
 @task(log_prints=True, retries=3)
-def download_data(url: str) -> pd.DataFrame:
+def download_data(url: str, push_to_s3: bool) -> pd.DataFrame:
     # Extract filename from URL
     filename = url.split('/')[-1]
 
@@ -52,6 +53,22 @@ def download_data(url: str) -> pd.DataFrame:
     os.system(f"wget {url} -O {filename}")
 
     pf = pq.ParquetFile(filename)
+
+    if push_to_s3:
+        # Load AWS credentials from block
+        aws_credentials_block = AwsCredentials.load('dez-credentials')
+
+        bucket_name = 'dez2023-dez-prefect'
+
+        s3_bucket = S3Bucket(
+            bucket_name=bucket_name,
+            credentials=aws_credentials_block,
+        )
+
+        # Specify parquet file
+        s3_bucket_path = s3_bucket.upload_from_path(from_path=filename, to_path=filename)
+
+        print(s3_bucket_path)
 
     return pf
 
@@ -119,7 +136,7 @@ def main_flow():
 
     log_subflow(table_name=table)
 
-    parquet_file = download_data(url)
+    parquet_file = download_data(url, push_to_s3=True)
 
     postgresql_connector = SqlAlchemyConnector.load('postgresql-connector')
     postgresql_engine = postgresql_connector.get_engine()
