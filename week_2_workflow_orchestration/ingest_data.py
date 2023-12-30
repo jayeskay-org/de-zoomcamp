@@ -1,12 +1,15 @@
+from io import BytesIO
 from time import time
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 from prefect import flow, task
 from prefect_sqlalchemy import SqlAlchemyConnector
 from prefect_aws import AwsCredentials, S3Bucket
 import os
 import pandas as pd
 import pyarrow.parquet as pq
-import pandas_redshift as pr
+import boto3
+import uuid
 
 
 # Create AWSLoader class with connection credentials for Redshift
@@ -31,10 +34,11 @@ class AWSLoader:
         return \
         (
             {
-                'dbname': self.database,
+                'drivername': self.driver,
+                'database': self.database,
                 'host': self.host,
                 'port': self.port,
-                'user': self.user,
+                'username': self.user,
                 'password': self.password.get_secret_value(),
             }
         )
@@ -53,34 +57,80 @@ class AWSLoader:
     # Define SQLAlchemy engine object
     def connect_to_redshift(self) -> None:
         sqlalchemy_credentials = self.get_sqlalchemy_credentials()
-        aws_credentials = self.get_aws_credentials()
-        
-        # Connect to Redshift
-        pr.connect_to_redshift(**sqlalchemy_credentials)
 
-        # Connect to S3
-        pr.connect_to_s3(
-            **aws_credentials,
-            bucket='dez2023-dez-prefect',
-            subdirectory='test'
+        global engine, connection
+
+        url = URL.create(**sqlalchemy_credentials)
+        
+        # Configure Redshift engine; connect
+        # https://docs.sqlalchemy.org/en/14/core/connections.html
+        engine = create_engine(url)
+        connection = engine.connect()
+
+
+    def connect_to_s3(self):
+        aws_credentials = self.get_aws_credentials()
+
+        global s3_client
+
+        s3_client = boto3.client(
+            's3',
+            **aws_credentials
         )
+
+
+    # Load to S3
+    def df_to_s3(self, data_frame: pd.DataFrame, bucket: str, object_name: str, subdir='.') -> None:
+        if subdir == '.':
+            key = object_name
+        else:
+            key = f"{subdir}/{object_name}"
+
+        with BytesIO() as parquet_buffer:
+            data_frame.to_parquet(parquet_buffer, index=False)
+            s3_client.put_object(Bucket=bucket, Key=key, Body=parquet_buffer.getvalue())
 
 
     # Load DataFrame
-    def load_to_redshift(self, data_frame: pd.DataFrame, table_name: str) -> None:
-        pr.pandas_to_redshift(
+    def load_to_redshift(self, conn, data_frame: pd.DataFrame, bucket: str, schema: str, table_name: str) -> None:
+        identifier = uuid.uuid4()
+
+        self.df_to_s3(
             data_frame=data_frame,
-            redshift_table_name=table_name,
-            append=True
+            bucket=bucket,
+            subdir=schema,
+            object_name=f"{table_name}_{identifier}.parquet"
         )
 
+        print(f"LOADED {table_name}_{identifier}.parquet to S3")
 
-    def close_connection(self):
-        pr.close_up_shop()
+        # https://docs.aws.amazon.com/redshift/latest/dg/loading-data-access-permissions.html
+        # https://stackoverflow.com/questions/28271049/redshift-copy-operation-doesnt-work-in-sqlalchemy
+        s = text(
+            f'''
+                COPY
+                    {schema}.{table_name}
+
+                FROM
+                    's3://{bucket}/{schema}/{table_name}_{identifier}.parquet'
+
+                IAM_ROLE
+                    'arn:aws:iam::221807757711:role/s3_readonly'
+
+                PARQUET;
+            '''
+        ).execution_options(autocommit=True)
+
+        print(f"EXECUTING {s}")
+        conn.execute(s)
+
+
+    def close_connection(self) -> None:
+        connection.close()
 
 
 @task(log_prints=True, retries=3)
-def download_data(url: str, push_to_s3: bool) -> pd.DataFrame:
+def download_data(url: str, push_to_s3=False, **kwargs) -> pd.DataFrame:
     # Extract filename from URL
     filename = url.split('/')[-1]
 
@@ -97,10 +147,8 @@ def download_data(url: str, push_to_s3: bool) -> pd.DataFrame:
         # Load AWS credentials from block
         aws_credentials_block = AwsCredentials.load('dez-credentials')
 
-        bucket_name = 'dez2023-dez-prefect'
-
         s3_bucket = S3Bucket(
-            bucket_name=bucket_name,
+            bucket_name=kwargs['bucket'],
             credentials=aws_credentials_block,
         )
 
@@ -112,34 +160,52 @@ def download_data(url: str, push_to_s3: bool) -> pd.DataFrame:
     return pf
 
 
+# @task(log_prints=True, retries=3)
+def create_table(conn, schema, table) -> None:
+    # Define CREATE statement
+    s = f'''
+        CREATE TABLE {schema}.{table} (
+            vendorid                BIGINT,
+            tpep_pickup_datetime    TIMESTAMP,
+            tpep_dropoff_datetime   TIMESTAMP,
+            passenger_count         DOUBLE PRECISION,
+            trip_distance           DOUBLE PRECISION,
+            ratecodeid              DOUBLE PRECISION,
+            store_and_fwd_flag      VARCHAR(256),
+            pulocationid            BIGINT,
+            dolocationid            BIGINT,
+            payment_type            BIGINT,
+            fare_amount             DOUBLE PRECISION,
+            extra                   DOUBLE PRECISION,
+            mta_tax                 DOUBLE PRECISION,
+            tip_amount              DOUBLE PRECISION,
+            tolls_amount            DOUBLE PRECISION,
+            improvement_surcharge   DOUBLE PRECISION,
+            total_amount            DOUBLE PRECISION,
+            congestion_surcharge    DOUBLE PRECISION,
+            airport_fee             DOUBLE PRECISION
+        );
+    '''
+
+    # Use AWSLoader connection to execute DROP STATEMENT (if exists); execute above CREATE statement
+    conn.execute(f"DROP TABLE IF EXISTS {schema}.{table};")
+    conn.execute(s)
+
+
 @task(log_prints=True, retries=3)
-def create_table(engine, pf, table) -> None:
-    # Pull in subset of source data
-    df = pf.read().to_pandas()[:100]
-
-    # Clean up columns, cast date/time strings
-    df.columns = df.columns.str.lower().str.replace(' ', '_')
-    df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'])
-    df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'])
-
-    # Create connection object to create schema, drop table, recreate using defined schema
-    with engine.connect() as conn:
-        # Create schema string
-        s = pd.io.sql.get_schema(df, name=table, con=conn)
-
-        # Drop table (if exists); create using schema string (as SQLAlchemy text)
-        conn.execute(text(f"DROP TABLE IF EXISTS {table};"))
-        conn.execute(text(s))
-
-
-@task(log_prints=True, retries=3)
-def ingest_data(parquet_file, batch_size, table, connector_block: SqlAlchemyConnector, credentials_block: AwsCredentials, url: str, export_to_s3: bool):
+def ingest_data(parquet_file, batch_size, bucket, schema, table,
+                connector_block: SqlAlchemyConnector, credentials_block: AwsCredentials,
+                url: str, export_to_s3: bool):
     counter = 0
 
     df = pd.DataFrame()
 
     aws_loader = AWSLoader(connector_block=connector_block, credentials_block=credentials_block)
+
+    aws_loader.connect_to_s3()
     aws_loader.connect_to_redshift()
+
+    create_table(conn=connection, schema=schema, table=table)
 
     t_start = time()
 
@@ -153,11 +219,12 @@ def ingest_data(parquet_file, batch_size, table, connector_block: SqlAlchemyConn
             raise
         else:
             df_i.columns = df_i.columns.str.replace(' ', '_').str.lower()
+            df_i['store_and_fwd_flag'] = df_i['store_and_fwd_flag'].fillna(value='')
             df_i['tpep_pickup_datetime'] = pd.to_datetime(df_i['tpep_pickup_datetime'])
             df_i['tpep_dropoff_datetime'] = pd.to_datetime(df_i['tpep_dropoff_datetime'])
         finally:
             counter += len(df_i)
-            aws_loader.load_to_redshift(data_frame=df_i, table_name=table)
+            aws_loader.load_to_redshift(conn=connection, data_frame=df_i, bucket=bucket, schema=schema, table_name=table)
             df = pd.concat([df, df_i])
 
         t_i_end = time()
@@ -171,7 +238,7 @@ def ingest_data(parquet_file, batch_size, table, connector_block: SqlAlchemyConn
     print(f"{counter} rows inserted in {round(t_end - t_start, 4)} seconds")
 
     if export_to_s3:
-        bucket_name = 'dez2023-dez-prefect'
+        bucket_name = bucket
         filename = url.split('/')[-1].replace('.parquet', '_CLEANSED.parquet')
 
         df.to_parquet(filename)
@@ -191,34 +258,33 @@ def ingest_data(parquet_file, batch_size, table, connector_block: SqlAlchemyConn
 
 
 @flow(name='Subflow: Table Name')
-def log_subflow(table_name: str) -> None:
-    print(f"Logging subflow for {table_name}")
+def log_subflow(schema: str, table: str) -> None:
+    print(f"Logging subflow for {schema}.{table}")
 
 
 @flow(name='Flow: Ingest')
-def main_flow():
-    table = 'yellow_taxi_data'
-    url = 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-01.parquet'
+def main_flow(bucket: str, schema: str, table: str, url: str) -> None:
+    log_subflow(schema=schema, table=table)
 
-    log_subflow(table_name=table)
-
-    parquet_file = download_data(url, push_to_s3=True)
-
-    redshift_connector = SqlAlchemyConnector.load('redshift-connector')
-    redshift_engine = redshift_connector.get_engine()
-
-    create_table(redshift_engine, parquet_file, table=table)
+    parquet_file = download_data(url, push_to_s3=True, bucket=bucket)
 
     ingest_data(
         parquet_file=parquet_file,
         batch_size=100000,
+        bucket=bucket,
+        schema=schema,
         table=table,
         connector_block=SqlAlchemyConnector.load('redshift-connector'),
         credentials_block=AwsCredentials.load('dez-credentials'),
         url=url,
-        export_to_s3=True
+        export_to_s3=False
     )
 
 
 if __name__ == '__main__':
-    main_flow()
+    BUCKET = 'dez2023-dez-prefect'
+    SCHEMA = 'ny_taxi'
+    TABLE = 'yellow_taxi_data'
+    SRC_URL = 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-01.parquet'
+
+    main_flow(bucket=BUCKET, schema=SCHEMA, table=TABLE, url=SRC_URL)
